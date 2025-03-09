@@ -1,10 +1,9 @@
 package ai.mlc.mlcllm
 
 import ai.mlc.mlcllm.OpenAIProtocol.*
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
-import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
@@ -109,7 +108,7 @@ class EngineState {
                 GlobalScope.launch {
 
                     res.usage?.let { finalUsage ->
-                        requestState.request.stream_options?.include_usage?.let { includeUsage ->
+                        requestState.request.stream_options?.let { includeUsage ->
                             if (includeUsage) {
                                 requestState.continuation.send(res)
                             }
@@ -143,6 +142,8 @@ class Completions(
     private val state: EngineState
 ) {
 
+    private val coroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
     suspend fun create(request: ChatCompletionRequest): ReceiveChannel<ChatCompletionStreamResponse> {
         return state.chatCompletion(jsonFFIEngine, request)
     }
@@ -165,32 +166,81 @@ class Completions(
         top_p: Float? = null,
         tools: List<ChatTool>? = null,
         user: String? = null,
-        response_format: ResponseFormat? = null
+        response_format: ResponseFormat? = null,
+        useChunking: Boolean = true, // Add the boolean parameter
+        chunkSize: Int = 10 // Add the chunk size parameter
     ): ReceiveChannel<ChatCompletionStreamResponse> {
         if (!stream) {
             throw IllegalArgumentException("Only stream=true is supported in MLCKotlin")
         }
 
-        val request = ChatCompletionRequest(
-            messages = messages,
-            model = model,
-            frequency_penalty = frequency_penalty,
-            presence_penalty = presence_penalty,
-            logprobs = logprobs,
-            top_logprobs = top_logprobs,
-            logit_bias = logit_bias,
-            max_tokens = max_tokens,
-            n = n,
-            seed = seed,
-            stop = stop,
-            stream = stream,
-            stream_options = stream_options,
-            temperature = temperature,
-            top_p = top_p,
-            tools = tools,
-            user = user,
-            response_format = response_format
-        )
-        return create(request)
+        val channel = Channel<ChatCompletionStreamResponse>(Channel.UNLIMITED)
+
+        coroutineScope.launch {
+            try {
+                if (useChunking) {
+                    val chunks = messages.chunked(chunkSize)
+
+                    for (chunk in chunks) {
+                        val request = ChatCompletionRequest(
+                            messages = chunk,
+                            model = model,
+                            frequency_penalty = frequency_penalty,
+                            presence_penalty = presence_penalty,
+                            logprobs = logprobs,
+                            top_logprobs = top_logprobs,
+                            logit_bias = logit_bias,
+                            max_tokens = max_tokens,
+                            n = n,
+                            seed = seed,
+                            stop = stop,
+                            stream = stream,
+                            stream_options = stream_options,
+                            temperature = temperature,
+                            top_p = top_p,
+                            tools = tools,
+                            user = user,
+                            response_format = response_format
+                        )
+                        val chunkChannel = create(request)
+                        for (response in chunkChannel) {
+                            channel.send(response)
+                        }
+                    }
+                } else {
+                    val request = ChatCompletionRequest(
+                        messages = messages,
+                        model = model,
+                        frequency_penalty = frequency_penalty,
+                        presence_penalty = presence_penalty,
+                        logprobs = logprobs,
+                        top_logprobs = top_logprobs,
+                        logit_bias = logit_bias,
+                        max_tokens = max_tokens,
+                        n = n,
+                        seed = seed,
+                        stop = stop,
+                        stream = stream,
+                        stream_options = stream_options,
+                        temperature = temperature,
+                        top_p = top_p,
+                        tools = tools,
+                        user = user,
+                        response_format = response_format
+                    )
+                    val responseChannel = create(request)
+                    for (response in responseChannel) {
+                        channel.send(response)
+                    }
+                }
+            } catch (e: Exception) {
+                // Handle any exceptions that occur during processing
+                Logger.getLogger(Completions::class.java.name).severe("Error in create function: $e")
+            } finally {
+                channel.close()
+            }
+        }
+
+        return channel
     }
 }
