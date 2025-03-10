@@ -7,6 +7,9 @@ import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlin.concurrent.thread
 import java.util.UUID
 import java.util.logging.Logger
@@ -178,12 +181,21 @@ class Completions(
 
         coroutineScope.launch {
             try {
+                val aggregatedJson = mutableMapOf<String, MutableList<JsonElement>>()
+                var previousResponseContent = ""
+
                 if (useChunking) {
                     val chunks = messages.chunked(chunkSize)
 
                     for (chunk in chunks) {
+                        val combinedMessages = if (previousResponseContent.isNotEmpty()) {
+                            chunk + ChatCompletionMessage("system", previousResponseContent)
+                        } else {
+                            chunk
+                        }
+
                         val request = ChatCompletionRequest(
-                            messages = chunk,
+                            messages = combinedMessages,
                             model = model,
                             frequency_penalty = frequency_penalty,
                             presence_penalty = presence_penalty,
@@ -204,7 +216,15 @@ class Completions(
                         )
                         val chunkChannel = create(request)
                         for (response in chunkChannel) {
-                            channel.send(response)
+                            try {
+                                val jsonResponse = Json.decodeFromString<JsonObject>(response.choices.first().message.content)
+                                jsonResponse.forEach { (key, value) ->
+                                    aggregatedJson.computeIfAbsent(key) { mutableListOf() }.addAll(value.jsonArray)
+                                }
+                                previousResponseContent = response.choices.first().message.content
+                            } catch (e: Exception) {
+                                Logger.getLogger(Completions::class.java.name).severe("Invalid JSON response: ${response.choices.first().message.content}")
+                            }
                         }
                     }
                 } else {
@@ -230,9 +250,42 @@ class Completions(
                     )
                     val responseChannel = create(request)
                     for (response in responseChannel) {
-                        channel.send(response)
+                        try {
+                            val jsonResponse = Json.decodeFromString<JsonObject>(response.choices.first().message.content)
+                            jsonResponse.forEach { (key, value) ->
+                                aggregatedJson.computeIfAbsent(key) { mutableListOf() }.addAll(value.jsonArray)
+                            }
+                        } catch (e: Exception) {
+                            Logger.getLogger(Completions::class.java.name).severe("Invalid JSON response: ${response.choices.first().message.content}")
+                        }
                     }
                 }
+
+                // Create the aggregated JSON response
+                val aggregatedResponse = JsonObject(
+                    aggregatedJson.mapValues { JsonArray(it.value) }
+                )
+
+                // Send the aggregated response
+                channel.send(
+                    ChatCompletionStreamResponse(
+                        id = UUID.randomUUID().toString(),
+                        `object` = "chat.completion",
+                        created = System.currentTimeMillis() / 1000,
+                        model = model ?: "unknown",
+                        choices = listOf(
+                            ChatCompletionChoice(
+                                index = 0,
+                                message = ChatCompletionMessage(
+                                    role = "assistant",
+                                    content = aggregatedResponse.toString()
+                                ),
+                                finish_reason = "stop"
+                            )
+                        )
+                    )
+                )
+
             } catch (e: Exception) {
                 // Handle any exceptions that occur during processing
                 Logger.getLogger(Completions::class.java.name).severe("Error in create function: $e")
