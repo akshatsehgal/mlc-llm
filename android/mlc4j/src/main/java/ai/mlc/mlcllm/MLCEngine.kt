@@ -108,8 +108,8 @@ class EngineState {
                 GlobalScope.launch {
 
                     res.usage?.let { finalUsage ->
-                        requestState.request.stream_options?.let { includeUsage ->
-                            if (includeUsage) {
+                        requestState.request.stream_options?.let { streamOptions ->
+                            if (streamOptions.include_usage) { // Ensure include_usage is used here
                                 requestState.continuation.send(res)
                             }
                         }
