@@ -1,13 +1,15 @@
 package ai.mlc.mlcllm
 
 import ai.mlc.mlcllm.OpenAIProtocol.*
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
-import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlin.concurrent.thread
 import java.util.UUID
 import java.util.logging.Logger
@@ -109,8 +111,8 @@ class EngineState {
                 GlobalScope.launch {
 
                     res.usage?.let { finalUsage ->
-                        requestState.request.stream_options?.include_usage?.let { includeUsage ->
-                            if (includeUsage) {
+                        requestState.request.stream_options?.let { streamOptions ->
+                            if (streamOptions.include_usage) { // Ensure include_usage is used here
                                 requestState.continuation.send(res)
                             }
                         }
@@ -143,6 +145,8 @@ class Completions(
     private val state: EngineState
 ) {
 
+    private val coroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
     suspend fun create(request: ChatCompletionRequest): ReceiveChannel<ChatCompletionStreamResponse> {
         return state.chatCompletion(jsonFFIEngine, request)
     }
@@ -165,32 +169,131 @@ class Completions(
         top_p: Float? = null,
         tools: List<ChatTool>? = null,
         user: String? = null,
-        response_format: ResponseFormat? = null
+        response_format: ResponseFormat? = null,
+        useChunking: Boolean = true, // Add the boolean parameter
+        chunkSize: Int = 10 // Add the chunk size parameter
     ): ReceiveChannel<ChatCompletionStreamResponse> {
         if (!stream) {
             throw IllegalArgumentException("Only stream=true is supported in MLCKotlin")
         }
 
-        val request = ChatCompletionRequest(
-            messages = messages,
-            model = model,
-            frequency_penalty = frequency_penalty,
-            presence_penalty = presence_penalty,
-            logprobs = logprobs,
-            top_logprobs = top_logprobs,
-            logit_bias = logit_bias,
-            max_tokens = max_tokens,
-            n = n,
-            seed = seed,
-            stop = stop,
-            stream = stream,
-            stream_options = stream_options,
-            temperature = temperature,
-            top_p = top_p,
-            tools = tools,
-            user = user,
-            response_format = response_format
-        )
-        return create(request)
+        val channel = Channel<ChatCompletionStreamResponse>(Channel.UNLIMITED)
+
+        coroutineScope.launch {
+            try {
+                val aggregatedJson = mutableMapOf<String, MutableList<JsonElement>>()
+                var previousResponseContent = ""
+
+                if (useChunking) {
+                    val chunks = messages.chunked(chunkSize)
+
+                    for (chunk in chunks) {
+                        val combinedMessages = if (previousResponseContent.isNotEmpty()) {
+                            chunk + ChatCompletionMessage("system", previousResponseContent)
+                        } else {
+                            chunk
+                        }
+
+                        val request = ChatCompletionRequest(
+                            messages = combinedMessages,
+                            model = model,
+                            frequency_penalty = frequency_penalty,
+                            presence_penalty = presence_penalty,
+                            logprobs = logprobs,
+                            top_logprobs = top_logprobs,
+                            logit_bias = logit_bias,
+                            max_tokens = max_tokens,
+                            n = n,
+                            seed = seed,
+                            stop = stop,
+                            stream = stream,
+                            stream_options = stream_options,
+                            temperature = temperature,
+                            top_p = top_p,
+                            tools = tools,
+                            user = user,
+                            response_format = response_format
+                        )
+                        val chunkChannel = create(request)
+                        for (response in chunkChannel) {
+                            try {
+                                val jsonResponse = Json.decodeFromString<JsonObject>(response.choices.first().message.content)
+                                jsonResponse.forEach { (key, value) ->
+                                    aggregatedJson.computeIfAbsent(key) { mutableListOf() }.addAll(value.jsonArray)
+                                }
+                                previousResponseContent = response.choices.first().message.content
+                            } catch (e: Exception) {
+                                Logger.getLogger(Completions::class.java.name).severe("Invalid JSON response: ${response.choices.first().message.content}")
+                            }
+                        }
+                    }
+                } else {
+                    val request = ChatCompletionRequest(
+                        messages = messages,
+                        model = model,
+                        frequency_penalty = frequency_penalty,
+                        presence_penalty = presence_penalty,
+                        logprobs = logprobs,
+                        top_logprobs = top_logprobs,
+                        logit_bias = logit_bias,
+                        max_tokens = max_tokens,
+                        n = n,
+                        seed = seed,
+                        stop = stop,
+                        stream = stream,
+                        stream_options = stream_options,
+                        temperature = temperature,
+                        top_p = top_p,
+                        tools = tools,
+                        user = user,
+                        response_format = response_format
+                    )
+                    val responseChannel = create(request)
+                    for (response in responseChannel) {
+                        try {
+                            val jsonResponse = Json.decodeFromString<JsonObject>(response.choices.first().message.content)
+                            jsonResponse.forEach { (key, value) ->
+                                aggregatedJson.computeIfAbsent(key) { mutableListOf() }.addAll(value.jsonArray)
+                            }
+                        } catch (e: Exception) {
+                            Logger.getLogger(Completions::class.java.name).severe("Invalid JSON response: ${response.choices.first().message.content}")
+                        }
+                    }
+                }
+
+                // Create the aggregated JSON response
+                val aggregatedResponse = JsonObject(
+                    aggregatedJson.mapValues { JsonArray(it.value) }
+                )
+
+                // Send the aggregated response
+                channel.send(
+                    ChatCompletionStreamResponse(
+                        id = UUID.randomUUID().toString(),
+                        `object` = "chat.completion",
+                        created = System.currentTimeMillis() / 1000,
+                        model = model ?: "unknown",
+                        choices = listOf(
+                            ChatCompletionChoice(
+                                index = 0,
+                                message = ChatCompletionMessage(
+                                    role = "assistant",
+                                    content = aggregatedResponse.toString()
+                                ),
+                                finish_reason = "stop"
+                            )
+                        )
+                    )
+                )
+
+            } catch (e: Exception) {
+                // Handle any exceptions that occur during processing
+                Logger.getLogger(Completions::class.java.name).severe("Error in create function: $e")
+            } finally {
+                channel.close()
+            }
+        }
+
+        return channel
     }
 }
